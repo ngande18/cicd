@@ -1,0 +1,152 @@
+# Cohesity upgrade paly book
+
+- name: RHEL 7+ cohesity upgrade playbook
+  become: True
+  become_user: root
+  become_method: sudo
+  hosts: all
+
+  pre_tasks:
+  - name: check for /usr/bin/python26
+    raw: "stat /usr/bin/python26"
+    changed_when: False
+    failed_when: False
+    register: python26_stat
+
+  - name: use /usr/bin/python26
+    set_fact:
+      ansible_python_interpreter: /usr/bin/python26
+    when:
+      python26_stat.rc == 0
+
+  - name: Check for /usr/libexec/platform-python
+    raw: "stat /usr/libexec/platform-python"
+    changed_when: False
+    failed_when: False
+    register: lep_stat
+
+  - name: use /usr/libexec/platform-python
+    set_fact:
+      ansible_python_interpreter: /usr/libexec/platform-python
+    when:
+      lep_stat.rc == 0
+
+  tasks:
+  - name: Gather only hardware-related facts
+    setup:
+      gather_subset: hardware
+
+  - name: debug
+    debug:
+      var: ansible_distribution
+
+  - fail:
+      msg: "Not the Correct OS: RHEL/CentOS only Installer"
+    when: not ((ansible_distribution == "RedHat") or (ansible_distribution == "CentOS"))
+
+  - fail:
+      msg: VM is not x86_64
+    when: (ansible_machine) != "x86_64"
+
+  - fail:
+      msg: VM is RHEL 5
+    when: ansible_distribution_major_version| int < 7
+
+  - name: lv is already defined
+    assert:
+      that:
+        - ansible_lvm.lvs.optcohesityap is defined
+      fail_msg: Either LV is not defined or too small
+      success_msg: optcohesityap is properly defined
+
+  - name: Check and set fact if /opt/cohesity is exists and mounted
+    set_fact:
+      opt_coheisty_exist: true
+    when: item.mount == '/opt/cohesity'
+    loop: "{{ ansible_mounts }}"
+
+  - fail:
+      msg: /opt/cohesity is not mounted
+    when: opt_coheisty_exist | bool == False
+
+  - name: gather VG name for cohesity mount point
+    set_fact:
+      cohe_VGN: "{{ ansible_lvm.lvs.optcohesityap.vg }}"
+
+  - name: Fail if insufficient space
+    fail:
+    when: ansible_lvm['vgs'][cohe_VGN]['free_g'] is version('0.25', '<')
+
+  - name: resize the logical volume to new size 384M
+    lvol:
+      vg: "{{ cohe_VGN }}"
+      lv: optcohesityap
+      size: 384m
+      resizefs: true
+    when: ansible_lvm.lvs.optcohesityap is defined and
+          ansible_lvm.lvs.optcohesityap.size_g is version('0.25', '=')
+
+  - name: Attaching UNIX ops pool
+    redhat_subscription:
+      state: present
+      pool_ids:
+        - 8a5e669e4e930ac6014eb5e1cb9e064c
+    ignore_errors: yes
+    when: ansible_distribution_major_version | int >= 7
+
+  - name: Enable Dev repoistory
+    rhsm_repository:
+      name: esi_UNIX_Ops_RHEL7_dev_x86_64
+      state: enabled
+    ignore_errors: yes
+    when: ( ansible_distribution_major_version| int ) >= 7 and ansible_local.esi.environment == "development"
+
+  - name: Enable QA repoistory
+    rhsm_repository:
+      name: esi_UNIX_Ops_RHEL7_qa_x86_64
+      state: enabled
+    ignore_errors: yes
+    when: ( ansible_distribution_major_version| int ) >= 7 and (ansible_local.esi.environment == "production" or ansible_local.esi.environment == "administration" or ansible_local.esi.environment == "DR" or ansible_local.esi.environment == "QA" or ansible_local.esi.environment == "UAT")
+
+  - name: Install Cohesity Agent (RHEL6/7)
+    yum:
+      name: cohesity-agent
+      state: latest
+    when: ansible_distribution_major_version == "6" or ansible_distribution_major_version == "7"
+
+  - name: Stop Cohesity Agent (RHEL6/7)
+    shell: "nohup /sbin/service cohesity-agent stop ; sleep 10 ; pkill cohesity ; sleep 10; pkill -9 cohesity"
+    ignore_errors: yes
+    when: ansible_distribution_major_version == "6" or ansible_distribution_major_version == "7"
+
+  - name: Remove /var/log/cohesity
+    file:
+      path: /var/log/cohesity
+      state: absent
+    ignore_errors: yes
+
+  - name: Create /opt/cohesity/logs
+    file:
+      path: /opt/cohesity/logs
+      state: directory
+
+  - name: Create a symlink from /var/log/cohesity to /opt/cohesity/logs
+    file:
+      src: /opt/cohesity/logs
+      dest: /var/log/cohesity
+      state: link
+
+
+  - name: Start Cohesity (RHEL6/7)
+    service:
+      name: cohesity-agent
+      state: restarted
+      enabled: yes
+      sleep: 10
+    when: ansible_distribution_major_version == "6" or ansible_distribution_major_version == "7"
+
+  - name: Remove /opt/cohesity/tmp
+    file:
+      path: /opt/cohesity/tmp
+      state: absent
+    ignore_errors: yes
