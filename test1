@@ -1,0 +1,397 @@
+#! /usr/bin/env /usr/bin/python3
+# Generates a report of vulnerabilities in Aqua
+# Requires Python 3.6 or above
+
+import requests, ssl, json, os, sys, re, csv, math
+import smtplib
+import hmac, hashlib
+import pandas as pd
+from glob import glob
+# noinspection PyInterpreter
+from urllib.parse import quote_plus
+from openpyxl import Workbook, load_workbook
+from getpass import getpass
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.application import MIMEApplication
+from datetime import date, datetime
+import time
+requests.packages.urllib3.disable_warnings(requests.packages.urllib3.exceptions.InsecureRequestWarning)
+
+class Aqua:
+    # Calling the aqua class creates a token to be used for all other methods
+    def __init__(self):
+        self.urlv2 = f'https://632d9ec7ca.cloud.aquasec.com/api/v2'
+        print("Aqua: logging in to workload")
+
+        api_key = os.environ.get("KEY")
+        secret = os.environ.get("SECRET")
+        timestamp = str(int(time.time() * 1000))
+        body = {"validity":240,"allowed_endpoints": ['DELETE', 'GET', 'POST', 'PUT'], "csp_roles": ["API Monitoring"]}
+        request = timestamp + "POST/v2/tokens" + json.dumps(body, separators=(',', ':'))
+        signature = hmac.new(bytes(secret, "utf-8"), msg=bytes(request, "utf-8"), digestmod=hashlib.sha256).hexdigest()
+
+        headers = {"accept": "application/json", "x-api-key": api_key, "x-signature": signature, "x-timestamp": timestamp, "content-type": "application/json"}
+        try:
+            status = requests.post('https://api.cloudsploit.com/v2/tokens', headers=headers, json=body)
+            status.raise_for_status()
+            self.headers = {"Accept": "application/json", 'Content-Type': 'application/json; charset=UTF-8', 'Authorization': 'Bearer ' + status.json()["data"]}
+        except requests.exceptions.HTTPError as err:
+            raise SystemExit(err)
+
+    # This generates a list of running containers
+    def getRunningContainers(self):
+        page = 1
+        pagesize = 50
+        count = 0
+        containers = []
+        print("Aqua: getting running containers")
+        while True:
+            try:
+                print(self.headers)
+                r_containers = requests.get(f'{self.urlv2}/containers?groupby=containers&status=running&page={page}&pagesize={pagesize}',
+                headers=self.headers)
+                r_containers.raise_for_status()
+            except requests.exceptions.HTTPError as err:
+                raise SystemExit(err)
+            results = r_containers.json()
+            pagecount = results['count']
+            containers += results['result']
+            page += 1
+            count += pagesize
+            print(str(count) + "/" + str(pagecount) + "\r", end='', flush=True)
+            if count >= pagecount:
+                break
+        return containers
+    
+    def getRegisteredImages(self):
+        page = 1
+        pagesize = 50
+        count = 0
+        images = []
+        print("Aqua: getting registered images")
+        while True:
+            try:
+                r_images = requests.get(f'{self.urlv2}/images?page={page}&pagesize={pagesize}',
+                headers=self.headers,
+                verify=False)
+                r_images.raise_for_status()
+            except requests.exceptions.HTTPError as err:
+                raise SystemExit(err)
+            results = r_images.json()
+            pagecount = results['count']
+            images += results['result']
+            page += 1
+            count += pagesize
+            print(str(count) + "/" + str(pagecount) + "\r", end='', flush=True)
+            if count >= pagecount:
+                break
+        return images
+
+    def removeDuplicateImages(self, images):
+        new_images = []
+        print("Aqua: removing duplicate images")
+        for i in images:
+            if i not in new_images:
+                new_images.append(i)
+        return new_images
+
+    def addNamespace(self, containers, images):
+        new_images = []
+        print("Aqua: addNamespace")
+        for c in containers:
+            for i in images:
+                if f'{i["name"]}' in f'{c["origin_image_name"]}':
+                    i['namespace_name'] = c['namespace_name']
+                    i['compliant'] = c['image_assurance_compliant']
+                    i['cluster_name'] = c['cluster_name']
+                    i["ihost_id"] = c["host_id"]
+                    i["iid"] = c["id"]
+                    i["iname"] = c["name"]
+                    new_images.append(i)
+                    break
+        return new_images
+
+    def addVulnsToImage(self, images):
+        page = 1
+        pagesize = 100
+        print("Aqua: addVulnsToImage")
+        for count, i in enumerate(images):
+            print(str(count) + "/" + str(len(images)) + "\r", end='', flush=True)
+            i["detailed_vulnerabilities"] = []
+            try:
+                image = quote_plus(i['name'])
+                registry = quote_plus(i['registry'])
+                r_vulns = requests.get(f'{self.urlv2}/risks/vulnerabilities?page={page}&pagesize={pagesize}&image_name={image}&registry_name={registry}',
+                headers=self.headers,
+                verify=False)
+                r_vulns.raise_for_status()
+            except requests.exceptions.HTTPError as err:
+                raise SystemExit(err)
+            results = r_vulns.json()
+            i['detailed_vulnerabilities'] = results['result']
+        return images
+
+    def addBaseImage(self, images):
+        print("Aqua: add base image")
+        for count, i in enumerate(images):
+            print(str(count) + "/" + str(len(images)) + "\r", end='', flush=True)
+            name = i['name']
+            try:
+                # https://docs.aquasec.com/v6.5/reference#get-specific-image
+                r_base = requests.get(f'{self.urlv2}/images/{i["registry"]}/{i["repository"]}/{i["tag"]}',
+                headers=self.headers,
+                verify=False)
+                r_base.raise_for_status()
+            except requests.exceptions.HTTPError as err:
+                raise SystemExit(err)
+            results = r_base.json()
+            try:
+                i['base_image'] = results['parent']['name']
+            except:
+                i['base_image'] = ""
+        return images
+
+    def getCatalogImages(self, images):
+        print("Aqua: get catalog image")
+        catalog_images = [x for x in images if x['name'].split('/')[0] == 'mtb-docker-ga']
+        return catalog_images
+
+    def generateImageStats(self, images):
+        report = {}
+        print("Aqua: generateImageStats")
+        for i in images:
+            image_name = i['name']
+            if i['detailed_vulnerabilities'] == None:
+                report[image_name] = {}
+                report[image_name]['Tag'] = i['tag']
+                report[image_name]['Vulnerabilities'] = []
+                newvuln = {}
+                newvuln['Vulnerability'] = 'N/A'
+                newvuln['Severity'] = ''
+                newvuln['Date Found'] = ''
+                newvuln['Fix Version'] = ''
+                newvuln['Description'] = ''
+                report[image_name]['Vulnerabilities'].append(newvuln)
+            else:
+                report[image_name] = {}
+                report[image_name]['Tag'] = i['tag']
+                report[image_name]['Vulnerabilities'] = []
+                for v in i['detailed_vulnerabilities']:
+                    newvuln = {}
+                    newvuln['Vulnerability'] = v['name']
+                    newvuln['Severity'] = v['aqua_severity']
+                    newvuln['Date Found'] = v['first_found_date']
+                    newvuln['Fix Version'] = v['fix_version']
+                    newvuln['Description'] = v['description']
+                    report[image_name]['Vulnerabilities'].append(newvuln)
+        return report
+
+    def generateImageReport(self, image_report, output_filename):
+        print("Aqua: generateImageReport")
+        dest_catalog_filename = output_filename
+        wb = Workbook()
+        ws = wb.active
+        ws.title = 'Catalog'
+        row = 0
+        titles = ['Image', 'Tag', 'Vulnerability', 'Severity', 'Date Found', 'Fix Version', 'Description']
+        ws.append(titles)
+        for r in image_report:
+            for v in image_report[r]['Vulnerabilities']:
+                values = [r, image_report[r]['Tag'], v['Vulnerability'], v['Severity'], v['Date Found'], v['Fix Version'], v['Description']]
+                ws.append(values)
+        wb.save(filename = dest_catalog_filename)
+
+    # Generates a dict for easy processing of vulnerabilities. Includes a summary of the vulns per each namespace.
+    def generateContainerStats(self, containers):
+        report = {}
+        print("Aqua: generateContainerStats")
+        for c in containers:
+            if c['detailed_vulnerabilities'] == None:
+                # Skip this container if no vulnerabilities are found
+                continue
+            if c['namespace_name'] not in report:
+                report[c['namespace_name']] = {}
+                report[c['namespace_name']]['Vulnerabilities'] = []
+                report[c['namespace_name']]['Base Image'] = c['base_image']
+
+            for v in c['detailed_vulnerabilities']:
+                newvuln = {}
+                #container_link = f'https://aqua.apps.ose{self.region}.mtb.com/#/workloads/{c["ihost_id"]}/{c["iid"]}/{c["iname"]}/risk'
+                image_name = v['image_name']
+                cluster_name = c["cluster_name"]
+                #newvuln['Container'] = f'=HYPERLINK("{container_link}", "{image_name}")'
+                newvuln['Container'] = image_name
+                newvuln['Vulnerability'] = v['name']
+                newvuln['Severity'] = v['aqua_severity']
+                newvuln['Date Found'] = v['first_found_date']
+                newvuln['Publish Date'] = v['publish_date']
+                newvuln['Modification Date'] = v['modification_date']
+                newvuln['Cluster Name'] = cluster_name
+                newvuln['Fix Version'] = v['fix_version']
+                newvuln['Description'] = v['description']
+                newvuln['Compliant'] = "Yes" if c['compliant'] == True else "No"
+                report[c['namespace_name']]['Vulnerabilities'].append(newvuln)
+        return report
+
+    # Generates a spreadsheet based on the stats created in generateRunningStats
+    def generateContainerReport(self, container_report, dest_filename):
+        print("Aqua: generateContainerReport")
+        wb = Workbook()
+        ws = wb.active
+        ws.title = 'Vulns'
+        row = 0
+        titles = ['Namespace', 'Cluster Name', 'Container', 'Base Image', 'Vulnerability', 'Severity', 'Date Found', 'Publish Date', 'Modification Date', 'Fix Version', 'Compliant', 'Description']
+        ws.append(titles)
+        for r in container_report:
+            for v in container_report[r]['Vulnerabilities']:
+                values = [r, v['Cluster Name'], v['Container'], container_report[r]['Base Image'],
+                v['Vulnerability'], v['Severity'], v['Date Found'], v['Publish Date'], v['Modification Date'], v['Fix Version'], v['Compliant'], v['Description']]
+                ws.append(values)
+        wb.save(filename = dest_filename)
+
+def mergexlsx(files, dest_filename):
+    print("merging files to " + str(dest_filename))
+    df = pd.DataFrame()
+    df_unique = pd.DataFrame()
+    for file in files:
+        wb = load_workbook(file)
+        ws = wb.active
+        df = df.append(pd.DataFrame(ws.values))
+    # Just in case duplicates got missed somehow
+    df_unique = df.drop_duplicates()
+    df_unique.to_excel(dest_filename, index=False, header=False)
+
+
+def emailxlsx(filenames, subject, body, fromAddr, toAddr, CC):
+    print("Emailing")
+    print("    filenames: " + str(filenames))
+    print("    subject: " + str(subject))
+    print("    body: " + str(body))
+    print("    fromAddr: " + str(fromAddr))
+    print("    toAddr: " + str(toAddr))
+    print("    cc: " + str(CC))
+    # Create a multipart message and set headers
+    message = MIMEMultipart()
+    message["From"] = fromAddr
+    message["To"] = ', '.join(toAddr)
+    message["Subject"] = subject
+    message["CC"] = CC
+
+    # Add body to email
+    message.attach(MIMEText(body, "html"))
+    for filename in filenames:
+        attachment = MIMEApplication(open(filename, 'rb').read())
+        attachment.add_header('Content-Disposition', 'attachment', filename=filename)
+        message.attach(attachment)
+
+    try:
+        mail = smtplib.SMTP('vmwsmtp.mandtbank.com', 25)
+        mail.sendmail(fromAddr, toAddr, message.as_string())
+    except SMTPException as e:
+        print(f'There was a problem sending the mail: {e}')
+        sys.exit(1)
+
+    mail.quit()
+
+def cleanxlsx():
+    print("cleanxlsx")
+    files = glob('./*.xlsx')
+    for file in files:
+        os.remove(file)
+
+# Get the app codes from running report
+# Get the app code's TO using api call from app code lookup
+# Segmenting the running report based on app code
+# Send email on behalf of vulnerability DL
+# Seperate the running report into segmented reports to send to TOs
+
+# Get app code's TO email
+def get_app_code_to_mail(app_code):
+    info = requests.get("https://appcodelookup.apps.oseprod.mtb.com/ac/" + app_code, verify=False).json()
+    return info["result"][0]["toemail"]
+
+def get_app_code_ts_mails(app_code):
+    info = requests.get("https://appcodelookup.apps.oseprod.mtb.com/ac/" + app_code, verify=False).json()
+    return info["result"][0]["tsemail"]
+
+# Get app code from running report xlsx file
+def get_app_codes(running_report):
+    df = pd.DataFrame()
+    df = df.append(pd.read_excel(running_report, engine='openpyxl'))
+    namespaces = df["Namespace"].values
+    # Remove duplicate app codes by using a set
+    app_codes = [*set(map(lambda x: x[:3], namespaces))]
+    return app_codes
+
+# Input running report, will segment into new file appended with app code
+def segment_app_code_from_report(running_report, app_code):
+    wb = load_workbook(running_report)
+    ws = wb.active
+    data = ws.values
+    columns = next(data)[0:]
+    df = pd.DataFrame(data, columns=columns)
+    df = df[df["Namespace"].str.startswith(app_code)]
+    new_running_report = f"aqua_running_report_{app_code}.xlsx"
+    df.to_excel(new_running_report, index=False)
+    return new_running_report
+
+def main():
+    #regions = ['dev', 'cert', 'extcert', 'prod', 'ext', 'proddr', 'extdr']
+    #regions = ['cert', 'extcert', 'prod', 'ext', 'proddr', 'extdr']
+
+    files = []
+    dest_filename = f'aqua_report.xlsx'
+    a = Aqua()
+    containers = a.getRunningContainers()
+    images = a.getRegisteredImages()
+    containers = a.addNamespace(containers, images)
+    containers = a.removeDuplicateImages(containers)
+    containers = a.addBaseImage(containers)
+    containers = a.addVulnsToImage(containers)
+    print("    Aqua generating report")
+    report = a.generateContainerStats(containers)
+    a.generateContainerReport(report, dest_filename)
+    files.append(dest_filename)
+
+       # Get Catalog scans from Prod
+    images = []
+#    dest_image_filename = 'aqua_catalog_report.xlsx'
+#    a = Aqua('prod')
+#    images = a.getRegisteredImages()
+#    images = a.addVulnsToImage(images)
+#    images = a.getCatalogImages(images)
+#    ireport = a.generateImageStats(images)
+#    a.generateImageReport(ireport, dest_image_filename)
+
+    # Send running report to vulnerability management
+    if os.environ.get("SEND_TO_APPS") is None:
+        subject = f"AQS SAAS Running Vulnerability Report PROD"
+        body = f"Please see attached for vulnerabilities reported by Aqua on {date.today()}"
+        toAddr = ["bpuri@mtb.com"]
+        fromAddr = "dl-kubernetes@prod.mtb.com"
+        CC = ""
+        email_files = [dest_filename]
+        emailxlsx(email_files, subject, body, fromAddr, toAddr, CC)
+
+    # Send running report segmented to app code TOs
+    if os.environ.get("SEND_TO_APPS"):
+        proj_dir = os.environ.get("CI_PROJECT_DIR")
+        app_codes = get_app_codes(dest_filename)
+        for app_code in app_codes:
+            segmented_report = segment_app_code_from_report(dest_filename, app_code)
+            subject = f"OpenShift report for {app_code}"
+            body = f""
+            with open(proj_dir + "/TO_email_body.html", "r") as f:
+                body += f"{f.read()}".format(date=date.today(), app_code=app_code)
+            toAddr = ["bpuri@mtb.com"]
+            fromAddr = "dl-kubernetes@prod.mtb.com"
+            CC = get_app_code_ts_mails(app_code)
+            email_files = [segmented_report]
+            emailxlsx(email_files, subject, body, fromAddr, toAddr, CC)
+
+    cleanxlsx()
+
+    sys.exit()
+
+main()
